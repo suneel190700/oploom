@@ -1,0 +1,35 @@
+pipeline: invoice_intake
+description: Validate inbound vendor invoices and route for payment or review.
+
+required_fields: [vendor, invoice_number, amount, currency, due_date]
+
+stages:
+  - name: intake
+    retry: { max_attempts: 1, backoff_seconds: 0 }
+  - name: classify
+    retry: { max_attempts: 3, backoff_seconds: 5 }
+  - name: route
+    retry: { max_attempts: 3, backoff_seconds: 5 }
+  - name: act
+    retry: { max_attempts: 2, backoff_seconds: 10 }
+
+classification:
+  model: claude-haiku-4-5-20251001
+  labels: [standard, duplicate_suspect, anomalous]
+  instructions: >
+    Classify this invoice. "standard" = routine invoice consistent with its
+    fields; "duplicate_suspect" = invoice number or vendor+amount pattern
+    suggests a possible duplicate; "anomalous" = unusual amount, vendor, or
+    terms that warrant human review.
+
+routing:
+  standard: schedule_payment
+  duplicate_suspect: hold_for_review
+  anomalous: hold_for_review
+
+approval:
+  required_when:
+    - field: classification
+      equals: anomalous
+    - field: amount
+      greater_than: 5000
