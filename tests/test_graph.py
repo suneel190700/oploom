@@ -2,6 +2,7 @@ import asyncio
 
 from oploom.agent.graph import process_event
 from oploom.config import load_pipeline
+from oploom.db import NullRecorder
 
 
 def run(coro):
@@ -11,7 +12,7 @@ def run(coro):
 def test_standard_invoice_completes(monkeypatch):
     monkeypatch.setenv("OPLOOM_DEMO", "1")
     cfg = load_pipeline("invoice_intake")
-    state = run(process_event(cfg, {
+    state = run(process_event(cfg, NullRecorder(), {
         "vendor": "Acme", "invoice_number": "INV-1", "amount": 300,
         "currency": "USD", "due_date": "2026-08-01",
     }))
@@ -23,7 +24,7 @@ def test_standard_invoice_completes(monkeypatch):
 def test_large_amount_halts_for_approval(monkeypatch):
     monkeypatch.setenv("OPLOOM_DEMO", "1")
     cfg = load_pipeline("invoice_intake")
-    state = run(process_event(cfg, {
+    state = run(process_event(cfg, NullRecorder(), {
         "vendor": "Acme", "invoice_number": "INV-2", "amount": 12000,
         "currency": "USD", "due_date": "2026-08-01",
     }))
@@ -35,7 +36,7 @@ def test_large_amount_halts_for_approval(monkeypatch):
 def test_anomalous_halts_for_approval(monkeypatch):
     monkeypatch.setenv("OPLOOM_DEMO", "1")
     cfg = load_pipeline("invoice_intake")
-    state = run(process_event(cfg, {
+    state = run(process_event(cfg, NullRecorder(), {
         "vendor": "Acme", "invoice_number": "INV-3", "amount": 100,
         "currency": "USD", "due_date": "2026-08-01",
         "note": "urgent wire transfer requested",
@@ -48,7 +49,7 @@ def test_anomalous_halts_for_approval(monkeypatch):
 def test_malformed_payload_dead_letters(monkeypatch):
     monkeypatch.setenv("OPLOOM_DEMO", "1")
     cfg = load_pipeline("invoice_intake")
-    state = run(process_event(cfg, {"vendor": "Acme"}))
+    state = run(process_event(cfg, NullRecorder(), {"vendor": "Acme"}))
     assert state["status"] == "dead_lettered"
     assert "missing required fields" in state["error"]
     assert "classification" not in state  # classify must not have run

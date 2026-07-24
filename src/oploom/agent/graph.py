@@ -1,6 +1,7 @@
 """The agent core: a LangGraph state machine driven entirely by pipeline YAML.
 
-Stages: intake -> classify -> route -> act.
+Stages: intake -> classify -> route -> act. Every stage attempt is recorded
+through the Recorder; module 4 wraps these nodes with retry/DLQ machinery.
 
 Modes:
   OPLOOM_DEMO=1 (default)  deterministic classifier, no API key needed
@@ -10,12 +11,13 @@ Modes:
 from __future__ import annotations
 
 import os
-import uuid
 from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 
 from ..config import PipelineConfig
+from ..db import Recorder
+from ..logging import get_logger
 
 
 class EventState(TypedDict, total=False):
@@ -34,7 +36,6 @@ def demo_mode() -> bool:
 
 
 def _demo_classify(cfg: PipelineConfig, payload: dict) -> str:
-    """Deterministic stand-in so the full graph runs offline."""
     text = " ".join(str(v) for v in payload.values()).lower()
     keyword_map = {
         "invoice_intake": [
@@ -69,42 +70,78 @@ def _llm_classify(cfg: PipelineConfig, payload: dict) -> str:
     return result.label
 
 
-def build_graph(cfg: PipelineConfig):
+def build_graph(cfg: PipelineConfig, recorder: Recorder):
+    log = get_logger(pipeline=cfg.pipeline)
+
+    async def _recorded(state: EventState, stage: str, fn) -> EventState:
+        """Run one stage, recording start/finish. Single attempt for now —
+        module 4 replaces the except branch with retry -> DLQ."""
+        run_id = await recorder.stage_started(state["event_id"], stage, attempt=1)
+        try:
+            update = await fn(state)
+        except Exception as exc:
+            await recorder.stage_finished(
+                state["event_id"], run_id, "failed", {"error": str(exc)}
+            )
+            await recorder.update_event(state["event_id"], status="dead_lettered")
+            log.error("stage.error", stage=stage, error=str(exc))
+            return {**state, "status": "dead_lettered", "error": str(exc)}
+        await recorder.stage_finished(state["event_id"], run_id, "succeeded", update)
+        return {**state, **update}
+
     async def intake(state: EventState) -> EventState:
-        missing = [f for f in cfg.required_fields if f not in state["payload"]]
-        if missing:
-            return {
-                **state,
-                "status": "dead_lettered",
-                "error": f"missing required fields: {missing}",
-            }
-        return {**state, "status": "running"}
+        async def fn(s):
+            missing = [f for f in cfg.required_fields if f not in s["payload"]]
+            if missing:
+                raise ValueError(f"missing required fields: {missing}")
+            await recorder.update_event(s["event_id"], status="running")
+            return {"status": "running"}
+        return await _recorded(state, "intake", fn)
 
     async def classify(state: EventState) -> EventState:
-        label = (
-            _demo_classify(cfg, state["payload"])
-            if demo_mode()
-            else _llm_classify(cfg, state["payload"])
-        )
-        return {**state, "classification": label}
+        async def fn(s):
+            label = (
+                _demo_classify(cfg, s["payload"])
+                if demo_mode()
+                else _llm_classify(cfg, s["payload"])
+            )
+            await recorder.update_event(s["event_id"], classification=label)
+            return {"classification": label}
+        return await _recorded(state, "classify", fn)
 
     async def route(state: EventState) -> EventState:
-        action = cfg.routing[state["classification"]]
-        fields = {**state["payload"], "classification": state["classification"]}
-        if cfg.approval_reason(fields):
-            return {**state, "route": action, "status": "pending_approval"}
-        return {**state, "route": action}
+        async def fn(s):
+            action = cfg.routing[s["classification"]]
+            fields = {**s["payload"], "classification": s["classification"]}
+            reason = cfg.approval_reason(fields)
+            if reason:
+                await recorder.create_approval(s["event_id"], reason)
+                await recorder.update_event(
+                    s["event_id"], route=action, status="pending_approval"
+                )
+                return {"route": action, "status": "pending_approval"}
+            await recorder.update_event(s["event_id"], route=action)
+            return {"route": action}
+        return await _recorded(state, "route", fn)
 
     async def act(state: EventState) -> EventState:
-        # Real side effects arrive with n8n in module 5; recording the action
-        # completes the state machine end to end.
-        return {**state, "action": state["route"], "status": "completed"}
+        async def fn(s):
+            await recorder.update_event(
+                s["event_id"], action=s["route"], status="completed"
+            )
+            return {"action": s["route"], "status": "completed"}
+        return await _recorded(state, "act", fn)
 
     def after_intake(state: EventState) -> str:
         return "halt" if state.get("status") == "dead_lettered" else "classify"
 
+    def after_classify(state: EventState) -> str:
+        return "halt" if state.get("status") == "dead_lettered" else "route"
+
     def after_route(state: EventState) -> str:
-        return "halt" if state.get("status") == "pending_approval" else "act"
+        if state.get("status") in ("dead_lettered", "pending_approval"):
+            return "halt"
+        return "act"
 
     g = StateGraph(EventState)
     g.add_node("intake", intake)
@@ -113,16 +150,19 @@ def build_graph(cfg: PipelineConfig):
     g.add_node("act", act)
     g.set_entry_point("intake")
     g.add_conditional_edges("intake", after_intake, {"classify": "classify", "halt": END})
-    g.add_edge("classify", "route")
+    g.add_conditional_edges("classify", after_classify, {"route": "route", "halt": END})
     g.add_conditional_edges("route", after_route, {"act": "act", "halt": END})
     g.add_edge("act", END)
     return g.compile()
 
 
-async def process_event(cfg: PipelineConfig, payload: dict) -> EventState:
-    graph = build_graph(cfg)
+async def process_event(
+    cfg: PipelineConfig, recorder: Recorder, payload: dict
+) -> EventState:
+    event_id = await recorder.create_event(cfg.pipeline, payload)
+    graph = build_graph(cfg, recorder)
     initial: EventState = {
-        "event_id": str(uuid.uuid4()),
+        "event_id": event_id,
         "pipeline": cfg.pipeline,
         "payload": payload,
         "status": "received",
