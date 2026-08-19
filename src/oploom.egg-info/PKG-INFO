@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: oploom
-Version: 0.1.0
-Summary: Agentic workflow automation with human-in-the-loop orchestration
-Requires-Python: >=3.11
-Requires-Dist: pydantic>=2.7
-Requires-Dist: pyyaml>=6.0
