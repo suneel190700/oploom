@@ -1,7 +1,7 @@
 """The agent core: a LangGraph state machine driven entirely by pipeline YAML.
 
-Stages: intake -> classify -> route -> act. Every stage attempt is recorded
-through the Recorder; module 4 wraps these nodes with retry/DLQ machinery.
+Stages: intake -> classify -> route -> act. Every stage attempt is a
+stage_runs row; failures retry per the YAML policy, then dead-letter.
 
 Modes:
   OPLOOM_DEMO=1 (default)  deterministic classifier, no API key needed
@@ -10,6 +10,7 @@ Modes:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, TypedDict
 
@@ -18,6 +19,10 @@ from langgraph.graph import END, StateGraph
 from ..config import PipelineConfig
 from ..db import Recorder
 from ..logging import get_logger
+
+
+class PermanentError(Exception):
+    """Failure that retrying cannot fix (bad payload, unknown label...)."""
 
 
 class EventState(TypedDict, total=False):
@@ -66,34 +71,63 @@ def _llm_classify(cfg: PipelineConfig, payload: dict) -> str:
         f"{cfg.classification.instructions}\n\nEvent fields:\n{payload}"
     )
     if result.label not in labels:
-        raise ValueError(f"model returned unknown label {result.label!r}")
+        raise PermanentError(f"model returned unknown label {result.label!r}")
     return result.label
 
 
 def build_graph(cfg: PipelineConfig, recorder: Recorder):
     log = get_logger(pipeline=cfg.pipeline)
 
+    async def _dead_letter(
+        state: EventState, stage: str, attempts: int, error: str
+    ) -> EventState:
+        await recorder.dead_letter(
+            state["event_id"], stage, attempts, error, state["payload"]
+        )
+        await recorder.update_event(state["event_id"], status="dead_lettered")
+        log.error("event.dead_lettered", stage=stage, attempts=attempts, error=error)
+        return {**state, "status": "dead_lettered", "error": error}
+
     async def _recorded(state: EventState, stage: str, fn) -> EventState:
-        """Run one stage, recording start/finish. Single attempt for now —
-        module 4 replaces the except branch with retry -> DLQ."""
-        run_id = await recorder.stage_started(state["event_id"], stage, attempt=1)
-        try:
-            update = await fn(state)
-        except Exception as exc:
+        """Run one stage under its YAML retry policy. Each attempt is a
+        stage_runs row; exhaustion (or a PermanentError) dead-letters."""
+        policy = cfg.stage(stage).retry
+        last_error = ""
+        for attempt in range(1, policy.max_attempts + 1):
+            run_id = await recorder.stage_started(state["event_id"], stage, attempt)
+            try:
+                update = await fn(state)
+            except PermanentError as exc:
+                await recorder.stage_finished(
+                    state["event_id"], run_id, "failed",
+                    {"error": str(exc), "permanent": True},
+                )
+                log.warning("stage.permanent_failure", stage=stage, error=str(exc))
+                return await _dead_letter(state, stage, attempt, str(exc))
+            except Exception as exc:
+                last_error = str(exc)
+                await recorder.stage_finished(
+                    state["event_id"], run_id, "failed", {"error": last_error}
+                )
+                log.warning(
+                    "stage.retryable_failure",
+                    stage=stage, attempt=attempt,
+                    max_attempts=policy.max_attempts, error=last_error,
+                )
+                if attempt < policy.max_attempts:
+                    await asyncio.sleep(policy.backoff_seconds * attempt)
+                continue
             await recorder.stage_finished(
-                state["event_id"], run_id, "failed", {"error": str(exc)}
+                state["event_id"], run_id, "succeeded", update
             )
-            await recorder.update_event(state["event_id"], status="dead_lettered")
-            log.error("stage.error", stage=stage, error=str(exc))
-            return {**state, "status": "dead_lettered", "error": str(exc)}
-        await recorder.stage_finished(state["event_id"], run_id, "succeeded", update)
-        return {**state, **update}
+            return {**state, **update}
+        return await _dead_letter(state, stage, policy.max_attempts, last_error)
 
     async def intake(state: EventState) -> EventState:
         async def fn(s):
             missing = [f for f in cfg.required_fields if f not in s["payload"]]
             if missing:
-                raise ValueError(f"missing required fields: {missing}")
+                raise PermanentError(f"missing required fields: {missing}")
             await recorder.update_event(s["event_id"], status="running")
             return {"status": "running"}
         return await _recorded(state, "intake", fn)

@@ -78,6 +78,12 @@ class PipelineConfig(BaseModel):
                 raise ValueError(f"routing missing labels: {sorted(missing)}")
         return v
 
+    def stage(self, name: str) -> StageConfig:
+        for s in self.stages:
+            if s.name == name:
+                return s
+        raise KeyError(f"stage {name!r} not in pipeline {self.pipeline!r}")
+
     def approval_reason(self, event_fields: dict) -> str | None:
         """Description of the first matching approval rule, else None."""
         for rule in self.approval.required_when:

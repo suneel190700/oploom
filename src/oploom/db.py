@@ -26,6 +26,9 @@ class Recorder(Protocol):
         self, event_id: str, run_id: int, status: str, detail: dict | None = None
     ) -> None: ...
     async def create_approval(self, event_id: str, reason: str) -> None: ...
+    async def dead_letter(
+        self, event_id: str, stage: str, attempts: int, error: str, payload: dict
+    ) -> None: ...
 
 
 class NullRecorder:
@@ -46,6 +49,9 @@ class NullRecorder:
 
     async def create_approval(self, event_id: str, reason: str) -> None:
         log.info("approval.created", event_id=event_id, reason=reason)
+
+    async def dead_letter(self, event_id, stage, attempts, error, payload) -> None:
+        log.info("dlq.inserted", event_id=event_id, stage=stage, attempts=attempts)
 
 
 class PostgresRecorder:
@@ -101,6 +107,17 @@ class PostgresRecorder:
             "insert into approvals (event_id, reason) values ($1, $2)",
             uuid.UUID(event_id),
             reason,
+        )
+
+    async def dead_letter(self, event_id, stage, attempts, error, payload) -> None:
+        await self.pool.execute(
+            "insert into dlq (event_id, stage, attempts, error, payload) "
+            "values ($1, $2, $3, $4, $5)",
+            uuid.UUID(event_id),
+            stage,
+            attempts,
+            error,
+            json.dumps(payload),
         )
 
 
